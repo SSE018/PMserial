@@ -1,3 +1,6 @@
+modded for ESP-IDF v5.5.1
+tested ESP-32
+
 # PMSerial
 
 Arduino library for PM sensors with serial interface

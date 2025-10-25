@@ -8,17 +8,14 @@
 */
 
 #include "driver/uart.h"
-#include "esp_err.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/idf_additions.h"
 #include "freertos/projdefs.h"
-#include "hal/uart_types.h"
 #include "portmacro.h"
 #include <PMserial.h>
 #include <cstddef>
 #include <cstdint>
-#include <iostream>
 
 /* Sensor data format:
   https://github.com/avaldebe/AQmon/blob/master/lua_modules/pms3003.lua
@@ -65,8 +62,7 @@ DATA(MSB,LSB): Message body (28 bytes), 14 pairs of bytes (MSB,LSB)
 #define RD_BUF_SIZE (40)
 
 static const char TAG[] = "PMSerial";
-static uint8_t *databuf;
-static uint8_t dataLen;
+static uint8_t *dataBuf;
 
 static bool tsi_mode = false;
 static bool truncated_num = false;
@@ -113,8 +109,8 @@ esp_err_t SerialPM::init() {
                UART_PIN_NO_CHANGE);
   is_uart_driver_installed = true;
 
-  databuf = (uint8_t *)malloc(RD_BUF_SIZE);
-  assert(databuf);
+  dataBuf = (uint8_t *)malloc(RD_BUF_SIZE);
+  assert(dataBuf);
 
   xTaskCreate(SerialPM::uart_recv_handler_launcher,
               "uart_recv_handler_launcher", 3072, this, 12, &recv_task_handle);
@@ -130,66 +126,160 @@ void SerialPM::uart_recv_handler() {
   while (true) {
     if (xQueueReceive(uart_queue, (void *)&event, portMAX_DELAY)) {
       if (event.type == UART_DATA) {
-        memset(databuf, 0, RD_BUF_SIZE);
+        memset(dataBuf, 0, RD_BUF_SIZE);
         is_buffered = false;
 
-        uart_read_bytes(uart_port, databuf, event.size, portMAX_DELAY);
+        uart_read_bytes(uart_port, dataBuf, event.size, portMAX_DELAY);
         ESP_LOGD(TAG, "data recv");
 
-        dataLen = event.size;
-
-        if (!is_inited && dataLen == 1)
+        if (!is_inited && event.size == 1)
           is_buffered = true;
 
         // printf("%d: %d: ", dataLen, buff2wd(2));
         // for (int i = 0; i < dataLen; i += 2)
         //   printf("%04x ", buff2wd(i));
-        // std::cout << std::endl;
+        // printf("\n")
 
-        status = data_checker();
+        status = data_checker(dataBuf, event.size);
         if (status == OK) {
+          if (buff2wd(2, dataBuf) != 4) // is not command response,
+            data_parser(dataBuf, tsi_mode, truncated_num);
           is_buffered = true;
-          if (dataLen != 8)
-            data_parser(tsi_mode, truncated_num);
         }
       }
     }
   }
-  std::cout << "handler end\n";
   return;
 }
 
-esp_err_t SerialPM::uart_wait_with_timeout(uint16_t xTimeinMS) {
-  is_buffered = false;
-  int64_t time_wait_until = esp_timer_get_time() + xTimeinMS * 1000;
-  while (!is_buffered) {
-    vTaskDelay(pdMS_TO_TICKS(10));
-    if (esp_timer_get_time() > time_wait_until) {
-      ESP_LOGE(TAG, "UART timed out.");
-      return ESP_FAIL;
+esp_err_t SerialPM::uart_send_cmd(uint8_t *cmd) {
+
+  if (!is_inited && !is_buffered) {
+    int64_t time_wait_until = esp_timer_get_time() + 3000 * 1000;
+    while (!is_buffered) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      if (time_wait_until < esp_timer_get_time()) {
+        ESP_LOGE(TAG, "UART timed out.");
+        return ESP_FAIL;
+      }
     }
+  }
+  uart_write_bytes(uart_port, cmd, msgLen);
+
+  esp_err_t ret;
+  ret = uart_wait_tx_done(uart_port, portMAX_DELAY);
+  return ret;
+}
+
+esp_err_t SerialPM::set_mode(pmsx_sensor_mode_t _mode) {
+  esp_err_t ret;
+  uint8_t *cmd;
+  if (sensor_mode != _mode) {
+    if (_mode == PMSX_SENSOR_MODE_ACTIVE) {
+      cmd = (uint8_t *)cmd_actv;
+    } else {
+      cmd = (uint8_t *)cmd_pasv;
+    }
+    ret = uart_send_cmd(cmd);
+    if (ret != ESP_OK)
+      return ret;
+
+    int64_t time_wait_until = esp_timer_get_time() + max_wait_ms * 1000;
+    while (sensor_mode != _mode) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      if (time_wait_until < esp_timer_get_time()) {
+        ESP_LOGE(TAG, "mode cmd timed out.");
+        return ESP_FAIL;
+      }
+    }
+    ESP_LOGI(TAG, "sensor mode changed.");
+    return ret;
   }
   return ESP_OK;
 }
 
-esp_err_t SerialPM::uart_send_cmd(uint8_t *cmd) {
+esp_err_t SerialPM::set_sleep(pmsx_sensor_sleep_t _sleep) {
   esp_err_t ret;
-  if (!is_inited) {
-    ret = uart_wait_with_timeout(3000);
+  uint8_t *cmd;
+  if (sleep_state != _sleep) {
+    if (_sleep == PMSX_SENSOR_SLEEP) {
+      cmd = (uint8_t *)cmd_slep;
+    } else {
+      cmd = (uint8_t *)cmd_wkup;
+    }
+    ret = uart_send_cmd(cmd);
     if (ret != ESP_OK)
       return ret;
+
+    int64_t time_wait_until = esp_timer_get_time() + max_wait_ms * 1000;
+    while (sleep_state != _sleep) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      if (time_wait_until < esp_timer_get_time()) {
+        ESP_LOGE(TAG, "sleep/awake cmd timed out.");
+        return ESP_FAIL;
+      }
+    }
+    return ret;
   }
-  uart_write_bytes(uart_port, cmd, msgLen);
-  ret = uart_wait_tx_done(uart_port, portMAX_DELAY);
-  if (ret != ESP_OK)
-    return ret;
+  return ESP_OK;
+}
 
-  ret = uart_wait_with_timeout(max_wait_ms);
-  if (ret != ESP_OK)
-    return ret;
+SerialPM::~SerialPM() {
+  vTaskDelete(recv_task_handle);
+  if (is_uart_driver_installed) {
+    ESP_ERROR_CHECK(uart_driver_delete(uart_port));
+    is_uart_driver_installed = false;
+  }
+  free(dataBuf);
+  dataBuf = NULL;
+}
 
-  if (cmd != cmd_read && dataLen == 8) {
-    switch (buff2wd(4)) {
+uint16_t SerialPM::buff2wd(uint8_t n, uint8_t *raw_data) {
+  return (raw_data[n] << 8) | raw_data[n + 1];
+}
+
+pmsx_uart_status_t SerialPM::data_checker(uint8_t *raw_data,
+                                          uint8_t raw_data_length) {
+  if (buff2wd(0, raw_data) != 0x424D)
+    return ERROR_MSG_HEADER;
+
+  uint8_t Frame_Length = buff2wd(2, raw_data);
+
+  if (Frame_Length + 4 > raw_data_length)
+    return ERROR_MSG_LENGTH;
+
+  if (!checkBuffer(Frame_Length + 4, raw_data))
+    return ERROR_MSG_CKSUM;
+
+  if (Frame_Length + 4 != 8) { // flame_len 4 (datalen 8) is command return
+    pmsx_sensor_type_t detected_sensor;
+    switch (Frame_Length + 4) {
+    case 24:
+      detected_sensor = PLANTOWER_24B;
+      break;
+    case 32:
+      detected_sensor = PLANTOWER_32B;
+      break;
+    case 40:
+      detected_sensor = PLANTOWER_40B;
+      break;
+    default:
+      return ERROR_MSG_UNKNOWN;
+    }
+
+    // self discovery
+    if (sensor_type == PLANTOWER_AUTO)
+      sensor_type = detected_sensor;
+
+    if (sensor_type != detected_sensor) {
+      if (detected_sensor == PLANTOWER_32B && sensor_type != PLANTOWER_32B_S &&
+          sensor_type != PLANTOWER_32B_T) {
+        return ERROR_PMS_TYPE;
+      }
+    }
+  } else {
+    // Frame length=8, parse command resp
+    switch (buff2wd(4, raw_data)) {
     case 0xe100:
       ESP_LOGI(TAG, "Mode set to PASV");
       sensor_mode = PMSX_SENSOR_MODE_PASSIVE;
@@ -211,118 +301,35 @@ esp_err_t SerialPM::uart_send_cmd(uint8_t *cmd) {
       break;
     }
   }
-  return ret;
-}
-
-esp_err_t SerialPM::set_mode(pmsx_sensor_mode_t _mode) {
-  esp_err_t ret;
-  uint8_t *cmd;
-  if (sensor_mode != _mode) {
-    if (_mode == PMSX_SENSOR_MODE_ACTIVE) {
-      cmd = (uint8_t *)cmd_actv;
-    } else {
-      cmd = (uint8_t *)cmd_pasv;
-    }
-    ret = uart_send_cmd(cmd);
-    ESP_LOGI(TAG, "cmd sent");
-    return ret;
-  }
-  return ESP_OK;
-}
-
-esp_err_t SerialPM::set_sleep(pmsx_sensor_sleep_t _sleep) {
-  esp_err_t ret;
-  uint8_t *cmd;
-  if (sleep_state != _sleep) {
-    if (_sleep == PMSX_SENSOR_SLEEP) {
-      cmd = (uint8_t *)cmd_slep;
-    } else {
-      cmd = (uint8_t *)cmd_wkup;
-    }
-    ret = uart_send_cmd(cmd);
-    return ret;
-  }
-  return ESP_OK;
-}
-
-SerialPM::~SerialPM() {
-  vTaskDelete(recv_task_handle);
-  if (is_uart_driver_installed) {
-    ESP_ERROR_CHECK(uart_driver_delete(uart_port));
-    is_uart_driver_installed = false;
-  }
-  free(databuf);
-  databuf = NULL;
-}
-
-uint16_t SerialPM::buff2wd(uint8_t n) {
-  return (databuf[n] << 8) | databuf[n + 1];
-}
-
-pmsx_uart_status_t SerialPM::data_checker() {
-  if (buff2wd(0) != 0x424D)
-    return ERROR_MSG_HEADER;
-
-  if (buff2wd(2) + 4 != dataLen)
-    return ERROR_MSG_LENGTH;
-
-  if (dataLen != 8) { // dataLen 8 is command return
-    pmsx_sensor_type_t sensor_type_detect;
-    switch (dataLen) {
-    case 24:
-      sensor_type_detect = PLANTOWER_24B;
-      break;
-    case 32:
-      sensor_type_detect = PLANTOWER_32B;
-      break;
-    case 40:
-      sensor_type_detect = PLANTOWER_40B;
-      break;
-    default:
-      return ERROR_MSG_UNKNOWN;
-    }
-
-    // self discovery
-    if (sensor_type == PLANTOWER_AUTO)
-      sensor_type = sensor_type_detect;
-
-    if (sensor_type != sensor_type_detect) {
-      if (sensor_type_detect == PLANTOWER_32B &&
-          sensor_type != PLANTOWER_32B_S && sensor_type != PLANTOWER_32B_T) {
-        return ERROR_PMS_TYPE;
-      }
-    }
-  }
-  if (!checkBuffer(dataLen))
-    return ERROR_MSG_CKSUM;
   return OK;
 }
 
-bool SerialPM::checkBuffer(size_t Len) {
-  uint16_t cksum = buff2wd(Len - 2);
+bool SerialPM::checkBuffer(size_t Len, uint8_t *raw_data) {
+  uint16_t cksum = buff2wd(Len - 2, raw_data);
   for (uint8_t n = 0; n < Len - 2; n++) {
-    cksum -= databuf[n];
+    cksum -= raw_data[n];
   }
   return (cksum == 0);
 }
 
-void SerialPM::data_parser(bool tsi_mode, bool truncated_num) {
+void SerialPM::data_parser(uint8_t *raw_data, bool tsi_mode,
+                           bool truncated_num) {
   uint8_t bin, n;
   if (!has_particulate_matter())
     return;
   for (bin = 0, n = tsi_mode ? TSI_START : ATM_START; bin < 3; bin++, n += 2) {
-    pm[bin] = buff2wd(n);
+    pm[bin] = buff2wd(n, raw_data);
   }
 
   if (!has_number_concentration())
     return;
   for (bin = 0, n = NUM_START; bin < 6; bin++, n += 2) {
-    nc[bin] = buff2wd(n); // number particles w/diameter > r_bin
+    nc[bin] = buff2wd(n, raw_data); // number particles w/diameter > r_bin
   }
 
   switch (sensor_type) {
   case PMS5003S:
-    hcho = buff2wd(28) * 1e-3;
+    hcho = buff2wd(28, raw_data) * 1e-3;
     break;
   case PMS5003T:
     temp = int16_t(n5p0) * 1e-1 + temp_offset; // cast to signed integer 16bits
@@ -331,10 +338,10 @@ void SerialPM::data_parser(bool tsi_mode, bool truncated_num) {
     n10p0 = 0;
     break;
   case PMS5003ST:
-    hcho = buff2wd(28) * 1e-3;
-    temp = int16_t(buff2wd(30)) * 1e-1 +
+    hcho = buff2wd(28, raw_data) * 1e-3;
+    temp = int16_t(buff2wd(30, raw_data)) * 1e-1 +
            temp_offset; // cast to signed integer 16bits
-    rhum = buff2wd(32) * 1e-1 + rhum_offset;
+    rhum = buff2wd(32, raw_data) * 1e-1 + rhum_offset;
     break;
   default:
     break;
@@ -351,4 +358,10 @@ pmsx_uart_status_t SerialPM::read(bool tsi_mode, bool truncated_num) {
   if (sensor_mode == PMSX_SENSOR_MODE_PASSIVE)
     uart_send_cmd((uint8_t *)&cmd_read);
   return status;
+}
+
+uint16_t *SerialPM::get_data() {
+  if (sensor_mode == PMSX_SENSOR_MODE_PASSIVE)
+    uart_send_cmd((uint8_t *)&cmd_read);
+  return data;
 }

@@ -101,6 +101,8 @@ public:
   // if sensor is passive, xmit uart pasv read cmd.
   // if active ,do nothing.
   pmsx_uart_status_t read(bool tsi_mode = false, bool truncated_num = false);
+  uint16_t *get_data();
+
   pmsx_uart_status_t get_status() { return status; }
   operator bool() { return status == OK; }
 
@@ -139,12 +141,11 @@ protected:
   }
 
   // utility functions
-  uint16_t buff2wd(uint8_t n);
-  bool checkBuffer(size_t Len);
+  uint16_t buff2wd(uint8_t n, uint8_t *raw_data);
+  bool checkBuffer(size_t Len, uint8_t *raw_data);
   esp_err_t uart_send_cmd(uint8_t *cmd);
-  pmsx_uart_status_t data_checker();
-  void data_parser(bool tsi_mode, bool truncated_num);
-  esp_err_t uart_wait_with_timeout(uint16_t xTimeinMS);
+  pmsx_uart_status_t data_checker(uint8_t *raw_data, uint8_t raw_data_length);
+  void data_parser(uint8_t *raw_data, bool tsi_mode, bool truncated_num);
 
   // message timing
   static const uint16_t max_wait_ms = 1000;

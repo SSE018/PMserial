@@ -141,8 +141,8 @@ protected:
   }
 
   // utility functions
-  uint16_t buff2wd(uint8_t n, uint8_t *raw_data);
-  bool checkBuffer(size_t Len, uint8_t *raw_data);
+  uint16_t buff2wd(uint8_t n, const uint8_t *raw_data);
+  bool checkBuffer(uint8_t Len, uint8_t *raw_data);
   esp_err_t uart_send_cmd(uint8_t *cmd);
   pmsx_uart_status_t data_checker(uint8_t *raw_data, uint8_t raw_data_length);
   void data_parser(uint8_t *raw_data, bool tsi_mode, bool truncated_num);
